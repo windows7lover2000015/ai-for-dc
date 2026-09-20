@@ -30,6 +30,7 @@ client = OpenAI(
 intents = discord.Intents.default()
 intents.message_content = True  # required to read message text
 bot = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(bot)
 
 # per-channel short-term memory: channel_id -> deque of {"role", "content"}
 history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
@@ -67,7 +68,45 @@ def ask_groq(channel_id: int, user_message: str) -> str:
 
 @bot.event
 async def on_ready():
+    await tree.sync()  # registers slash commands with Discord (global — can take up to ~1hr to first appear everywhere)
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
+
+
+# --- Slash commands -------------------------------------------------------
+
+@tree.command(name="ask", description="Ask the AI assistant something")
+async def ask_command(interaction: discord.Interaction, question: str):
+    await interaction.response.defer()  # shows "thinking..." while Groq responds
+    try:
+        loop = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(None, ask_groq, interaction.channel_id, question)
+    except Exception as e:
+        reply = f"Sorry, I ran into an error: `{e}`"
+
+    # Slash command replies also cap at 2000 chars; send first chunk as the
+    # reply, any overflow as follow-up messages.
+    chunks = [reply[i:i + MAX_REPLY_CHARS] for i in range(0, len(reply), MAX_REPLY_CHARS)] or [""]
+    await interaction.followup.send(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
+
+
+@tree.command(name="reset", description="Clear the AI's memory of this channel's conversation")
+async def reset_command(interaction: discord.Interaction):
+    history[interaction.channel_id].clear()
+    await interaction.response.send_message("Conversation history cleared for this channel.", ephemeral=True)
+
+
+@tree.command(name="help", description="Show what this bot can do")
+async def help_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "**SAIChatbot commands:**\n"
+        "`/ask <question>` — ask me anything\n"
+        "`/reset` — clear this channel's conversation memory\n"
+        "`/help` — show this message\n\n"
+        "You can also just @mention me or DM me directly instead of using commands.",
+        ephemeral=True,
+    )
 
 
 @bot.event
