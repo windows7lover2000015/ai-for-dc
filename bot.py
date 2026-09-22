@@ -1,6 +1,8 @@
 import os
+import time
 import asyncio
 import threading
+from datetime import datetime, timezone
 from collections import defaultdict, deque
 
 import discord
@@ -20,7 +22,7 @@ SYSTEM_PROMPT = (
     "Use Discord-flavored markdown (e.g. **bold**, `code`) where useful."
 )
 MAX_HISTORY = 10          # messages remembered per channel
-MAX_REPLY_CHARS = 1900    # Discord's hard limit is 2000
+EMBED_DESC_LIMIT = 4096   # Discord's embed description limit
 
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -36,9 +38,6 @@ tree = discord.app_commands.CommandTree(bot)
 history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 
 # --- Keep-alive web server ----------------------------------------------
-# Render's free tier (and some Railway setups) put a web service to sleep
-# after ~15 min of no HTTP traffic. This tiny Flask app gives UptimeRobot
-# something to ping every few minutes so the service never goes idle.
 keep_alive_app = Flask(__name__)
 
 
@@ -66,9 +65,50 @@ def ask_groq(channel_id: int, user_message: str) -> str:
     return reply
 
 
+async def generate_embed(channel_id: int, question: str) -> discord.Embed:
+    """Calls Groq, times it, and packages the reply into an embed styled
+    like: description = reply, footer = 'Groq • <model> • <ping>ms',
+    with Discord auto-appending ' • Today at HH:MM' from embed.timestamp."""
+    loop = asyncio.get_event_loop()
+    start = time.monotonic()
+    try:
+        reply = await loop.run_in_executor(None, ask_groq, channel_id, question)
+    except Exception as e:
+        reply = f"Sorry, I ran into an error: `{e}`"
+    ping_ms = int((time.monotonic() - start) * 1000)
+
+    embed = discord.Embed(description=reply[:EMBED_DESC_LIMIT], color=discord.Color.blurple())
+    embed.set_footer(text=f"Groq • {MODEL} • {ping_ms}ms")
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
+class ResponseView(discord.ui.View):
+    """Regenerate / thumbs up / thumbs down buttons attached to a reply."""
+
+    def __init__(self, question: str, channel_id: int):
+        super().__init__(timeout=600)  # buttons stop responding after 10 min idle
+        self.question = question
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="Regenerate", style=discord.ButtonStyle.primary, emoji="🔄")
+    async def regenerate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        new_embed = await generate_embed(self.channel_id, self.question)
+        await interaction.edit_original_response(embed=new_embed, view=self)
+
+    @discord.ui.button(style=discord.ButtonStyle.success, emoji="👍")
+    async def thumbs_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Thanks for the feedback! 👍", ephemeral=True)
+
+    @discord.ui.button(style=discord.ButtonStyle.danger, emoji="👎")
+    async def thumbs_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Thanks — noted. 👎", ephemeral=True)
+
+
 @bot.event
 async def on_ready():
-    await tree.sync()  # registers slash commands with Discord (global — can take up to ~1hr to first appear everywhere)
+    await tree.sync()  # registers slash commands with Discord (can take up to ~1hr globally)
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
 
 
@@ -77,18 +117,9 @@ async def on_ready():
 @tree.command(name="ask", description="Ask the AI assistant something")
 async def ask_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer()  # shows "thinking..." while Groq responds
-    try:
-        loop = asyncio.get_event_loop()
-        reply = await loop.run_in_executor(None, ask_groq, interaction.channel_id, question)
-    except Exception as e:
-        reply = f"Sorry, I ran into an error: `{e}`"
-
-    # Slash command replies also cap at 2000 chars; send first chunk as the
-    # reply, any overflow as follow-up messages.
-    chunks = [reply[i:i + MAX_REPLY_CHARS] for i in range(0, len(reply), MAX_REPLY_CHARS)] or [""]
-    await interaction.followup.send(chunks[0])
-    for chunk in chunks[1:]:
-        await interaction.followup.send(chunk)
+    embed = await generate_embed(interaction.channel_id, question)
+    view = ResponseView(question, interaction.channel_id)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @tree.command(name="reset", description="Clear the AI's memory of this channel's conversation")
@@ -117,7 +148,6 @@ async def on_message(message: discord.Message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
 
-    # Only respond to DMs or when explicitly @mentioned in a server
     if not (is_dm or is_mentioned):
         return
 
@@ -126,14 +156,10 @@ async def on_message(message: discord.Message):
         content = "Hello!"
 
     async with message.channel.typing():
-        try:
-            loop = asyncio.get_event_loop()
-            reply = await loop.run_in_executor(None, ask_groq, message.channel.id, content)
-        except Exception as e:
-            reply = f"Sorry, I ran into an error: `{e}`"
+        embed = await generate_embed(message.channel.id, content)
 
-    for i in range(0, len(reply), MAX_REPLY_CHARS):
-        await message.channel.send(reply[i:i + MAX_REPLY_CHARS])
+    view = ResponseView(content, message.channel.id)
+    await message.channel.send(embed=embed, view=view)
 
 
 if __name__ == "__main__":
