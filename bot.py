@@ -1,6 +1,6 @@
 import os
 import time
-import json
+import random
 import asyncio
 import threading
 from datetime import datetime, timezone
@@ -25,68 +25,68 @@ SYSTEM_PROMPT = (
 )
 MAX_HISTORY = 10          # messages remembered per channel
 EMBED_DESC_LIMIT = 4096   # Discord's embed description limit
-DEFAULT_PREFIX = "!"
 
-# --- Persistence (JSON Files) -------------------------------------------
-LEVELS_FILE = "levels.json"
-CONFIG_FILE = "config.json"
+# --- XP / leveling config --------------------------------------------------
+PREFIXES = [".", ">"]      # supported command prefixes, e.g. .rank or >rank
+XP_MIN, XP_MAX = 15, 25    # XP awarded per eligible message
+XP_COOLDOWN_SECONDS = 60   # per-user cooldown so spamming doesn't farm XP
 
-def load_data(filepath, default):
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
-
-def save_data(filepath, data):
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=4)
-
-# Data structure: levels[guild_id][user_id] = {"xp": 0, "level": 1}
-levels_data = load_data(LEVELS_FILE, {})
-# Data structure: config[guild_id] = {"prefix": "!", "level_channel_id": null}
-config_data = load_data(CONFIG_FILE, {})
-
-def get_prefix(bot_instance, message):
-    if not message.guild:
-        return DEFAULT_PREFIX
-    guild_id = str(message.guild.id)
-    return config_data.get(guild_id, {}).get("prefix", DEFAULT_PREFIX)
-
-# --- Client Setup --------------------------------------------------------
-client = OpenAI(
+groq_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY,
 )
 
 intents = discord.Intents.default()
 intents.message_content = True  # required to read message text
-bot = commands.Bot(command_prefix=get_prefix, intents=intents)
+intents.members = True  # required to see the full member list and resolve names reliably
+bot = commands.Bot(command_prefix=PREFIXES, intents=intents, help_command=None)
 
-# Short-term memory: channel_id -> deque of {"role", "content"}
+# per-channel short-term memory: channel_id -> deque of {"role", "content"}
 history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-# Cooldown tracker for XP gain (user_id -> last_xp_time)
-xp_cooldowns = {}
+
+# --- XP storage (in-memory — resets on restart/redeploy, see README) ------
+# (guild_id, user_id) -> total lifetime XP
+user_xp = defaultdict(int)
+# (guild_id, user_id) -> unix timestamp of last XP award, for cooldown
+last_xp_time = defaultdict(float)
+
+
+def calculate_level(total_xp: int):
+    """Turns cumulative XP into (level, xp_into_level, xp_needed_for_level)."""
+    level = 0
+    xp_needed = 100
+    remaining = total_xp
+    while remaining >= xp_needed:
+        remaining -= xp_needed
+        level += 1
+        xp_needed = 100 + level * 50
+    return level, remaining, xp_needed
+
+
+def progress_bar(current: int, total: int, length: int = 16) -> str:
+    filled = int(length * current / total) if total else 0
+    return "█" * filled + "░" * (length - filled)
+
 
 # --- Keep-alive web server ----------------------------------------------
 keep_alive_app = Flask(__name__)
+
 
 @keep_alive_app.route("/")
 def home():
     return "Bot is alive!"
 
+
 def run_keep_alive():
     port = int(os.environ.get("PORT", 8080))
     keep_alive_app.run(host="0.0.0.0", port=port)
 
-# --- Helper Functions ----------------------------------------------------
+
 def ask_groq(channel_id: int, user_message: str) -> str:
     history[channel_id].append({"role": "user", "content": user_message})
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history[channel_id])
 
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model=MODEL,
         messages=messages,
         max_tokens=800,
@@ -94,6 +94,7 @@ def ask_groq(channel_id: int, user_message: str) -> str:
     reply = response.choices[0].message.content
     history[channel_id].append({"role": "assistant", "content": reply})
     return reply
+
 
 async def generate_embed(channel_id: int, question: str) -> discord.Embed:
     loop = asyncio.get_event_loop()
@@ -109,12 +110,10 @@ async def generate_embed(channel_id: int, question: str) -> discord.Embed:
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
-def xp_for_level(level: int) -> int:
-    """XP required to reach the next level."""
-    return 5 * (level ** 2) + (50 * level) + 100
 
-# --- Views ---------------------------------------------------------------
 class ResponseView(discord.ui.View):
+    """Regenerate / thumbs up / thumbs down buttons attached to a reply."""
+
     def __init__(self, question: str, channel_id: int):
         super().__init__(timeout=600)
         self.question = question
@@ -134,77 +133,15 @@ class ResponseView(discord.ui.View):
     async def thumbs_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("Thanks — noted. 👎", ephemeral=True)
 
-# --- Event Handlers ------------------------------------------------------
+
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
+    await bot.tree.sync()  # registers slash commands (can take up to ~1hr globally)
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
 
-    # --- Leveling Logic ---
-    if message.guild:
-        guild_id = str(message.guild.id)
-        user_id = str(message.author.id)
-        now = time.time()
+# --- Slash commands ---------------------------------------------------------
 
-        # 60-second cooldown on XP per user to prevent spamming
-        if user_id not in xp_cooldowns or (now - xp_cooldowns[user_id]) > 60:
-            xp_cooldowns[user_id] = now
-            if guild_id not in levels_data:
-                levels_data[guild_id] = {}
-            if user_id not in levels_data[guild_id]:
-                levels_data[guild_id][user_id] = {"xp": 0, "level": 1}
-
-            user_stats = levels_data[guild_id][user_id]
-            user_stats["xp"] += 15  # XP added per message
-            needed_xp = xp_for_level(user_stats["level"])
-
-            if user_stats["xp"] >= needed_xp:
-                user_stats["level"] += 1
-                save_data(LEVELS_FILE, levels_data)
-
-                # Find level announcement channel
-                target_channel = message.channel
-                lvl_chan_id = config_data.get(guild_id, {}).get("level_channel_id")
-                if lvl_chan_id:
-                    configured_chan = bot.get_channel(lvl_chan_id)
-                    if configured_chan:
-                        target_channel = configured_chan
-
-                await target_channel.send(
-                    f"🎉 Congratulations {message.author.mention}! You've reached **Level {user_stats['level']}**!"
-                )
-            else:
-                save_data(LEVELS_FILE, levels_data)
-
-    # Process Prefix Commands
-    await bot.process_commands(message)
-
-    # --- AI Chat Processing (DMs & Mentions) ---
-    is_dm = isinstance(message.channel, discord.DMChannel)
-    is_mentioned = bot.user in message.mentions
-
-    if is_dm or is_mentioned:
-        # Ignore if message starts with prefix to prevent interference with prefix commands
-        current_prefix = get_prefix(bot, message)
-        if message.content.startswith(current_prefix):
-            return
-
-        content = message.content.replace(f"<@{bot.user.id}>", "").strip()
-        if not content:
-            content = "Hello!"
-
-        async with message.channel.typing():
-            embed = await generate_embed(message.channel.id, content)
-
-        view = ResponseView(content, message.channel.id)
-        await message.channel.send(embed=embed, view=view)
-
-# --- Slash Commands ------------------------------------------------------
 @bot.tree.command(name="ask", description="Ask the AI assistant something")
 async def ask_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
@@ -212,103 +149,125 @@ async def ask_command(interaction: discord.Interaction, question: str):
     view = ResponseView(question, interaction.channel_id)
     await interaction.followup.send(embed=embed, view=view)
 
+
 @bot.tree.command(name="reset", description="Clear the AI's memory of this channel's conversation")
 async def reset_command(interaction: discord.Interaction):
     history[interaction.channel_id].clear()
     await interaction.response.send_message("Conversation history cleared for this channel.", ephemeral=True)
 
-@bot.tree.command(name="rank", description="Check your current level and XP")
-async def rank_command(interaction: discord.Interaction, target: discord.Member = None):
-    target_user = target or interaction.user
-    guild_id = str(interaction.guild_id)
-    user_id = str(target_user.id)
 
-    stats = levels_data.get(guild_id, {}).get(user_id, {"xp": 0, "level": 1})
-    needed_xp = xp_for_level(stats["level"])
+@bot.tree.command(name="help", description="Show what this bot can do")
+async def help_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "**SAIChatbot commands:**\n"
+        "`/ask <question>` — ask me anything\n"
+        "`/reset` — clear this channel's conversation memory\n"
+        f"`{PREFIXES[0]}rank` / `{PREFIXES[1]}rank` — check your level & XP\n"
+        f"`{PREFIXES[0]}leaderboard` — see the top XP earners in this server\n"
+        "`/help` — show this message\n\n"
+        "You can also just @mention me or DM me directly instead of using commands.",
+        ephemeral=True,
+    )
 
-    embed = discord.Embed(title=f"📊 Rank for {target_user.display_name}", color=discord.Color.gold())
-    embed.set_thumbnail(url=target_user.display_avatar.url)
-    embed.add_field(name="Level", value=str(stats["level"]), inline=True)
-    embed.add_field(name="XP", value=f"{stats['xp']} / {needed_xp}", inline=True)
-    await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="leaderboard", description="View the server's top leveled members")
-async def leaderboard_command(interaction: discord.Interaction):
-    guild_id = str(interaction.guild_id)
-    guild_levels = levels_data.get(guild_id, {})
+# --- Prefix commands (e.g. .rank or >rank) ----------------------------------
 
-    if not guild_levels:
-        await interaction.response.send_message("No activity recorded yet!", ephemeral=True)
+@bot.command(name="ping")
+async def ping_command(ctx: commands.Context):
+    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+
+
+@bot.command(name="rank", aliases=["level", "xp"])
+async def rank_command(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    total = user_xp[(ctx.guild.id, member.id)]
+    level, into_level, needed = calculate_level(total)
+
+    embed = discord.Embed(color=discord.Color.blurple())
+    embed.set_author(name=f"{member.display_name}'s Rank", icon_url=member.display_avatar.url)
+    embed.add_field(name="Level", value=str(level), inline=True)
+    embed.add_field(name="Total XP", value=str(total), inline=True)
+    embed.add_field(
+        name="Progress",
+        value=f"`{progress_bar(into_level, needed)}` {into_level}/{needed} XP",
+        inline=False,
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="leaderboard", aliases=["lb", "top"])
+async def leaderboard_command(ctx: commands.Context):
+    # Every non-bot member of the server, defaulting to 0 XP if they haven't earned any yet
+    all_scores = [
+        (member.id, user_xp.get((ctx.guild.id, member.id), 0))
+        for member in ctx.guild.members
+        if not member.bot
+    ]
+    all_scores.sort(key=lambda pair: pair[1], reverse=True)
+    top = all_scores[:10]
+
+    if not top:
+        await ctx.send("No members found to rank.")
         return
 
-    sorted_users = sorted(guild_levels.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)[:10]
+    lines = []
+    for i, (uid, xp) in enumerate(top, start=1):
+        level, _, _ = calculate_level(xp)
+        lines.append(f"**{i}.** <@{uid}> — Level {level} ({xp} XP)")
 
-    description = ""
-    for i, (u_id, stats) in enumerate(sorted_users, 1):
-        member = interaction.guild.get_member(int(u_id))
-        name = member.display_name if member else f"User {u_id}"
-        description += f"**#{i} {name}** — Level {stats['level']} ({stats['xp']} XP)\n"
+    embed = discord.Embed(
+        title=f"🏆 {ctx.guild.name} Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    await ctx.send(embed=embed)
 
-    embed = discord.Embed(title=f"🏆 {interaction.guild.name} Leaderboard", description=description, color=discord.Color.gold())
-    await interaction.response.send_message(embed=embed)
 
-# --- Admin Slash Commands ------------------------------------------------
-@bot.tree.command(name="setprefix", description="Set the prefix for traditional commands (Admin only)")
-@discord.app_commands.checks.has_permissions(administrator=True)
-async def setprefix_command(interaction: discord.Interaction, new_prefix: str):
-    guild_id = str(interaction.guild_id)
-    if guild_id not in config_data:
-        config_data[guild_id] = {}
-    
-    config_data[guild_id]["prefix"] = new_prefix
-    save_data(CONFIG_FILE, config_data)
-    await interaction.response.send_message(f"Prefix updated to `{new_prefix}`", ephemeral=True)
+# --- Message handling: XP awarding + AI replies + command dispatch ---------
 
-@bot.tree.command(name="setlevelchannel", description="Set channel where level-up messages are sent (Admin only)")
-@discord.app_commands.checks.has_permissions(administrator=True)
-async def setlevelchannel_command(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_id = str(interaction.guild_id)
-    if guild_id not in config_data:
-        config_data[guild_id] = {}
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
 
-    config_data[guild_id]["level_channel_id"] = channel.id
-    save_data(CONFIG_FILE, config_data)
-    await interaction.response.send_message(f"Level-up announcements will now be sent in {channel.mention}", ephemeral=True)
+    # Award XP for any non-bot message in a server (not DMs), with a
+    # per-user cooldown so spam doesn't farm XP.
+    if message.guild is not None:
+        key = (message.guild.id, message.author.id)
+        now = time.time()
+        if now - last_xp_time[key] >= XP_COOLDOWN_SECONDS:
+            last_xp_time[key] = now
+            before_level, _, _ = calculate_level(user_xp[key])
+            user_xp[key] += random.randint(XP_MIN, XP_MAX)
+            after_level, _, _ = calculate_level(user_xp[key])
+            if after_level > before_level:
+                await message.channel.send(
+                    f"🎉 {message.author.mention} just leveled up to **Level {after_level}**!"
+                )
 
-# --- Prefix Commands -----------------------------------------------------
-@bot.command(name="setprefix")
-@commands.has_permissions(administrator=True)
-async def prefix_setprefix(ctx, new_prefix: str):
-    guild_id = str(ctx.guild.id)
-    if guild_id not in config_data:
-        config_data[guild_id] = {}
+    # Let discord.py handle prefix commands (.rank, >leaderboard, etc.)
+    await bot.process_commands(message)
 
-    config_data[guild_id]["prefix"] = new_prefix
-    save_data(CONFIG_FILE, config_data)
-    await ctx.send(f"Prefix updated to `{new_prefix}`")
+    # Prefix commands are handled above; don't also treat them as AI prompts
+    if message.content.startswith(tuple(PREFIXES)):
+        return
 
-@bot.command(name="setlevelchannel")
-@commands.has_permissions(administrator=True)
-async def prefix_setlevelchannel(ctx, channel: discord.TextChannel):
-    guild_id = str(ctx.guild.id)
-    if guild_id not in config_data:
-        config_data[guild_id] = {}
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_mentioned = bot.user in message.mentions
 
-    config_data[guild_id]["level_channel_id"] = channel.id
-    save_data(CONFIG_FILE, config_data)
-    await ctx.send(f"Level-up announcements directed to {channel.mention}")
+    if not (is_dm or is_mentioned):
+        return
 
-# Permissions Error Handler
-@setprefix_command.error
-@setlevelchannel_command.error
-@prefix_setprefix.error
-@prefix_setlevelchannel.error
-async def admin_command_error(ctx_or_interaction, error):
-    msg = "You need **Administrator** permissions to use this command."
-    if isinstance(ctx_or_interaction, discord.Interaction):
-        await ctx_or_interaction.response.send_message(msg, ephemeral=True)
-    else:
-        await ctx_or_interaction.send(msg)
+    content = message.content.replace(f"<@{bot.user.id}>", "").strip()
+    if not content:
+        content = "Hello!"
+
+    async with message.channel.typing():
+        embed = await generate_embed(message.channel.id, content)
+
+    view = ResponseView(content, message.channel.id)
+    await message.channel.send(embed=embed, view=view)
+
 
 if __name__ == "__main__":
     threading.Thread(target=run_keep_alive, daemon=True).start()
