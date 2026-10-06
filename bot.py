@@ -180,7 +180,10 @@ async def build_rank_embed(member: discord.Member) -> discord.Embed:
     return embed
 
 
-async def build_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+LEADERBOARD_PAGE_SIZE = 10
+
+
+def get_sorted_scores(guild: discord.Guild):
     guild_levels = levels_data.get(str(guild.id), {})
     # Every non-bot member, defaulting to level 1 / 0 XP if they haven't earned any yet
     all_scores = [
@@ -189,18 +192,52 @@ async def build_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
         if not member.bot
     ]
     all_scores.sort(key=lambda pair: (pair[1]["level"], pair[1]["xp"]), reverse=True)
-    top = all_scores[:10]
+    return all_scores
 
+
+def build_leaderboard_page(guild: discord.Guild, page: int):
+    all_scores = get_sorted_scores(guild)
+    total_pages = max(1, -(-len(all_scores) // LEADERBOARD_PAGE_SIZE))  # ceil division
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * LEADERBOARD_PAGE_SIZE
+    chunk = all_scores[start:start + LEADERBOARD_PAGE_SIZE]
     lines = [
-        f"**{i}.** <@{uid}> — Level {stats['level']} ({stats['xp']} XP)"
-        for i, (uid, stats) in enumerate(top, start=1)
+        f"**{start + i}.** <@{uid}> — Level {stats['level']} ({stats['xp']} XP)"
+        for i, (uid, stats) in enumerate(chunk, start=1)
     ] or ["No members found to rank."]
 
-    return discord.Embed(
-        title=f"🏆 {guild.name} Leaderboard",
+    embed = discord.Embed(
+        title=f"🏆 {guild.name} Leaderboard ({len(all_scores)} members)",
         description="\n".join(lines),
         color=discord.Color.gold(),
     )
+    embed.set_footer(text=f"Page {page + 1}/{total_pages}")
+    return embed, page, total_pages
+
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, page: int, total_pages: int):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.page = page
+        self.previous.disabled = page <= 0
+        self.next.disabled = page >= total_pages - 1
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed, new_page, total_pages = build_leaderboard_page(self.guild, self.page - 1)
+        await interaction.response.edit_message(embed=embed, view=LeaderboardView(self.guild, new_page, total_pages))
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed, new_page, total_pages = build_leaderboard_page(self.guild, self.page + 1)
+        await interaction.response.edit_message(embed=embed, view=LeaderboardView(self.guild, new_page, total_pages))
+
+
+def build_leaderboard_response(guild: discord.Guild):
+    embed, page, total_pages = build_leaderboard_page(guild, 0)
+    return embed, LeaderboardView(guild, page, total_pages)
 
 
 def build_help_text(guild: discord.Guild | None) -> str:
@@ -252,9 +289,10 @@ async def rank_slash(interaction: discord.Interaction, member: discord.Member = 
     await interaction.response.send_message(embed=await build_rank_embed(member))
 
 
-@bot.tree.command(name="leaderboard", description="See the top XP earners in this server")
+@bot.tree.command(name="leaderboard", description="See every member's XP ranking in this server")
 async def leaderboard_slash(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=await build_leaderboard_embed(interaction.guild))
+    embed, view = build_leaderboard_response(interaction.guild)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="setprefix", description="Set the command prefix for this server (Admin only)")
@@ -299,7 +337,8 @@ async def rank_command(ctx: commands.Context, member: discord.Member = None):
 
 @bot.command(name="leaderboard", aliases=["lb", "top"])
 async def leaderboard_command(ctx: commands.Context):
-    await ctx.send(embed=await build_leaderboard_embed(ctx.guild))
+    embed, view = build_leaderboard_response(ctx.guild)
+    await ctx.send(embed=embed, view=view)
 
 
 @bot.command(name="help")
