@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from collections import defaultdict, deque
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -71,7 +71,44 @@ groq_client = OpenAI(
 intents = discord.Intents.default()
 intents.message_content = True  # required to read message text
 intents.members = True          # required to list every member for the leaderboard & resolve names
-bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
+STATUS_TEXT = "this bot is free and open source do check it out at https://0efpyh.s.gy/discord-repo"
+STATUS_ACTIVITY = discord.CustomActivity(name=STATUS_TEXT)  # custom status text, always shown
+IDLE_AFTER_SECONDS = 300  # go "idle" after 5 minutes with nobody using the bot
+
+bot = commands.Bot(
+    command_prefix=get_prefix,
+    intents=intents,
+    help_command=None,
+    activity=STATUS_ACTIVITY,
+    status=discord.Status.online,
+)
+
+# --- Auto online/idle presence -------------------------------------------
+last_activity = time.time()
+current_status = discord.Status.online
+
+
+async def set_presence(status: discord.Status):
+    """Change online/idle, always keeping the custom status text.
+    Only calls Discord when the status actually changes (avoids rate limits)."""
+    global current_status
+    if status == current_status:
+        return
+    current_status = status
+    await bot.change_presence(status=status, activity=STATUS_ACTIVITY)
+
+
+async def mark_active():
+    """Call whenever someone uses the bot — flips to online immediately."""
+    global last_activity
+    last_activity = time.time()
+    await set_presence(discord.Status.online)
+
+
+@tasks.loop(seconds=30)
+async def presence_loop():
+    idle = (time.time() - last_activity) > IDLE_AFTER_SECONDS
+    await set_presence(discord.Status.idle if idle else discord.Status.online)
 
 # per-channel short-term memory: channel_id -> deque of {"role", "content"}
 history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
@@ -158,7 +195,19 @@ class ResponseView(discord.ui.View):
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    if not presence_loop.is_running():  # on_ready can fire more than once
+        presence_loop.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
+
+
+@bot.event
+async def on_command(ctx: commands.Context):
+    await mark_active()  # any prefix command counts as activity
+
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    await mark_active()  # slash commands and button clicks count as activity
 
 
 # --- Shared builders (used by both prefix and slash versions) --------------
@@ -431,6 +480,8 @@ async def on_message(message: discord.Message):
 
     if not (is_dm or is_mentioned):
         return
+
+    await mark_active()  # @mention or DM to the bot counts as activity
 
     content = message.content.replace(f"<@{bot.user.id}>", "").strip()
     if not content:
